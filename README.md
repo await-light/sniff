@@ -2,10 +2,17 @@
 
 ## Install 
 ```
-gcc sniff.c
+gcc sniff.c -o sniff
+gcc listener.c -o listener
 ```
 
 ## Usage
+setup sniffing programme
 ```
-sudo ./a.out
+sudo ./sniff port
+```
+
+start listening
+```
+./listener
 ```
