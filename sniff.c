@@ -1,29 +1,27 @@
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
-#include <string.h>
+#include <unistd.h>
 #include <stdint.h>
-#include <sys/socket.h>
+#include <string.h>
+#include <pthread.h>
 #include <sys/types.h>
+#include <sys/signal.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/if_ether.h>
-
-#define BUFFSIZE 65535
-#define MACBUFFSIZE 20
-#define ARP_OPCODE_REQUEST 1
-#define ARP_OPCODE_REPLY 2
-#define ICMP_TYPE_REQUEST 8
-#define ICMP_TYPE_REPLY 0
-#define IPTYPE_UDP 17
-#define IPTYPE_TCP 6 
-#define IPTYPE_ICMP 1
-
-typedef struct ether_header ETHER_HEADER;
+#define RECV_MAX_SIZE 0xffff
+#define MAX_LISTENERS 100
+#define BUFFER_SIZE 0xffff
+#define IP "0.0.0.0"
+#define IPTYPE_TCP 6
 
 typedef struct
 {
-	char type[BUFFSIZE];
-	char des[BUFFSIZE];
-} OUTPUT;
+	uint64_t source_mac: 48;
+	uint64_t destination_mac: 48;
+	uint16_t ether_type;
+} __attribute__((packed)) ETHER_HEADER;
 
 typedef struct
 {
@@ -45,321 +43,190 @@ typedef struct
 {
 	uint16_t source_port;
 	uint16_t destination_port;
-	uint16_t length;
-	uint16_t header_checksum;
-} __attribute__((packed)) UDP_HEADER;
-
-typedef struct
-{
-	uint16_t source_port;
-	uint16_t destination_port;
 	uint32_t sequence_number;
 	uint32_t acknowledgment_number;
 	uint8_t reserved: 4;
 	uint8_t header_length: 4;
-	uint8_t fin: 1;
-	uint8_t syn: 1;
-	uint8_t rst: 1;
-	uint8_t psh: 1;
-	uint8_t ack: 1;
-	uint8_t urg: 1;
-	uint8_t ece: 1;
-	uint8_t cwr: 1;
+	uint8_t flags;
     uint16_t window_size;
     uint16_t header_checksum;
     uint16_t urgent_pointer;
 } __attribute__((packed)) TCP_HEADER;
 
-typedef struct
-{
-	uint16_t hardware_type;
-	uint16_t protocol_type;
-	uint8_t hardware_size;
-	uint8_t protocol_size;
-	uint16_t opcode;
-	uint64_t source_mac: 48;
-	uint32_t source_ip;
-	uint64_t destination_mac: 48;
-	uint32_t destination_ip;
-} __attribute__((packed)) ARP_HEADER;
+int listenersnumber = 0;
+// Save socket fd //
+int listenerslist[MAX_LISTENERS];
 
-typedef struct
+void *sniff(void *args)
 {
-	uint8_t type;
-	uint8_t code;
-	uint16_t header_checksum;
-	uint16_t id;
-	uint16_t sequence_number;
-} __attribute__((packed)) ICMP_HEADER;
-
-void sprintf_ip_int2string(char *ip_string, void *intip)
-{
-	uint8_t *p = (uint8_t *)intip;
-	sprintf(ip_string, "%d.%d.%d.%d", *p, *(p + 1), *(p + 2), *(p + 3));
-}
-
-void sprintf_mac_string2format(char *mac_string, char ether_host[])
-{
-	sprintf(mac_string, "%02x:%02x:%02x:%02x:%02x:%02x",
-		ether_host[0],
-		ether_host[1],
-		ether_host[2],
-		ether_host[3],
-		ether_host[4],
-		ether_host[5]
-	);
-}
-
-int main(int argc, char argv[])
-{
-	/* Create socket */
+	/* Create sniffing socket */
 	int fd = -1;
 	fd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-	if (fd == -1)
+	if (fd < 0)
 	{
-		printf("Permission Denied.\n");
+		printf("[!] Create sniffing socket error: sniffing service " \
+			"will stop and programme will not work correctly\n");
+		return 0;
+	}
+	printf("[+] Create sniffing socket\n");
+
+	/* Receive data */
+	printf("[+] Start sniffing\n");
+	for (;;)
+	{
+		struct sockaddr srcaddr;
+		int srcaddr_size = sizeof(struct sockaddr);
+		memset(&srcaddr, 0, srcaddr_size);
+		// Data buffer //
+		char *data = (char *)malloc(BUFFER_SIZE * sizeof(char));
+		memset(data, 0, BUFFER_SIZE);
+		size_t recvlen = recvfrom(fd, data, BUFFER_SIZE, 0, &srcaddr, (socklen_t *)&srcaddr_size);
+		/*
+		Issue:
+		If this computer sends LAN data to listener,
+		the size of data sent to listen will increase the size of IP and TCP header
+		and this computer sniffs this bigger packet, then sends to listener
+		So it's not good to sniff data sent to listener 
+		*/
+		uint32_t data_source_ip, data_destination_ip;
+		uint16_t data_source_port, data_destination_port;
+		ETHER_HEADER *ether_header = (ETHER_HEADER *)data;
+		if (ntohs(ether_header -> ether_type) == ETHERTYPE_IP)
+		{
+			IP_HEADER *ip_header = (IP_HEADER *)(data + sizeof(ETHER_HEADER));
+			data_source_ip = ntohl(ip_header -> source_ip_address);
+			data_destination_ip = ntohl(ip_header -> destination_ip_address);
+			if ((ip_header -> protocol) == IPTYPE_TCP)
+			{
+				TCP_HEADER *tcp_header = (TCP_HEADER *)(data + sizeof(ETHER_HEADER) + sizeof(IP_HEADER));
+				data_source_port = ntohs(tcp_header -> source_port);
+				data_destination_port = ntohs(tcp_header -> destination_port);
+			}
+		}
+		// If data_destination_ip:port or data_source_ip:port in listeners list, stop sending //
+		int inlist = 0;
+		for (int c = 0; c < listenersnumber; ++c)
+		{	
+			struct sockaddr remoteaddr;
+			struct sockaddr_in *remoteaddr_in;
+			socklen_t sizeofaddr = sizeof(struct sockaddr);
+			getpeername(listenerslist[c], &remoteaddr, &sizeofaddr);
+			remoteaddr_in = (struct sockaddr_in *)&remoteaddr;
+			uint32_t listener_ip = ntohl(remoteaddr_in -> sin_addr.s_addr);
+			uint16_t listener_port = ntohs(remoteaddr_in -> sin_port);
+			if ((data_destination_ip == listener_ip && data_destination_port == listener_port) || \
+				(data_source_ip == listener_ip && data_source_port == listener_port))
+			{
+				inlist = 1;
+				break;
+			}
+		}
+		if (inlist)
+		{
+			continue;
+		}
+
+		// Broadcast //
+		for (int c = 0; c < listenersnumber; ++c)
+		{
+			if (send(listenerslist[c], data, recvlen, 0) < 0)
+			{
+				for (int i = c; i < listenersnumber; ++i)
+				{
+					listenerslist[i] = listenerslist[i + 1]; 
+				}
+				listenersnumber--;
+				printf("[+] Disconnect(index:%d), left:%d\n", c, listenersnumber);
+			}
+		}
+		free(data);
+	}
+	close(fd);
+}
+
+int main(int argc, char **argv)
+{
+	/* Setup sniffing programme */
+	pthread_t sniffth;
+	pthread_create(&sniffth, 0, sniff, 0);
+	// give sniffing programme 1 second to get ready //
+	sleep(1);
+
+	/*
+	1. Get the port of the service 
+	*/
+	uint16_t port = -1;
+	sscanf(argv[1], "%hd", &port);
+	if (port >= 0xffff || port <= 0)
+	{
+		printf("[x] You gave a wrong port\n");
 		return 0;
 	}
 
-	/* Receive loop */	
+	/*
+	1. Create Tcp socket
+		- create
+		- bind
+		- max listeners
+	2. Statu of listening
+		- accept
+	3. Add listener to list of listeners
+	(4. included by function `sniff`) Send data to listeners in list
+	*/
+	int tcpfd = -1;
+	struct sockaddr_in address;
+	memset(&address, 0, sizeof(struct sockaddr_in));
+	address.sin_family = AF_INET;
+	address.sin_port = htons(port);
+	address.sin_addr.s_addr = inet_addr(IP);
+	tcpfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (tcpfd == -1)
+	{
+		printf("[x] Create listener error\n");
+		return 0;
+	}
+	printf("[+] Create listener socket\n");
+	// Introduction: programme might quit when client is closed because of SIGPIPE signal! //
+	// struct sigaction sa;
+	// sa.sa_handler = SIG_IGN;
+	// sa.sa_flags = 0;
+	// if ((sigemptyset(&sa.sa_mask) < 0) || (sigaction(SIGPIPE, &sa, 0) < 0))
+	if (signal(SIGPIPE, SIG_IGN) < 0)
+	{
+		printf("[!] Set SIGPIPE handler, the programme will quit when client is closed\n");
+	}
+	printf("[+] Set SIGPIPE handler\n");
+	if (bind(tcpfd, (struct sockaddr *)&address, sizeof(struct sockaddr)) < 0)
+	{
+		printf("[x] Bind error\n");
+		return 0;
+	}
+	printf("[+] Bind to port: %hd\n", port);
+	if (listen(tcpfd, MAX_LISTENERS) < 0)
+	{
+		printf("[x] Set maximum number the listeners error\n");
+		return 0;
+	}
+	printf("[+] Set max listeners: %d\n", MAX_LISTENERS);
 	for (;;)
 	{
-		/* Received data buffer and output buffer */
-		char data[BUFFSIZE];
-		struct sockaddr saddr;
-		int saddr_size = sizeof(saddr);
-		OUTPUT output;
-		memset(output.type, 0, BUFFSIZE);
-		memset(output.des, 0, BUFFSIZE);
-
-		/* Receive data and format */
-		recvfrom(fd, data, BUFFSIZE, 0, &saddr, (socklen_t *)&saddr_size);
-		ETHER_HEADER *eth = (ETHER_HEADER *)data;
-
-		/* Get mac source and destination */
-		char sourcemac[MACBUFFSIZE] = "";
-		char destinationmac[MACBUFFSIZE] = "";
-		sprintf_mac_string2format(sourcemac, eth -> ether_shost);
-		sprintf_mac_string2format(destinationmac, eth -> ether_dhost);
-		strcat(output.des, "mac:");
-		strcat(output.des, sourcemac);
-		strcat(output.des, "->");
-		strcat(output.des, destinationmac);
-		strcat(output.des, "; ");
-
-		/* Judge what protocol is used */
-		switch (ntohs(eth -> ether_type))
+		int new_fd;
+		struct sockaddr raddress;
+		socklen_t addrlen = sizeof(struct sockaddr);
+		new_fd = accept(tcpfd, &raddress, &addrlen);
+		if (new_fd < 0)
 		{
-			/* IP protocol */
-			case (ETHERTYPE_IP): {
-				IP_HEADER *ipheader = (IP_HEADER *)(data + sizeof(ETHER_HEADER));
-
-				/* Int IP to String */
-				char sourceip[32], destinationip[32];
-				sprintf_ip_int2string(sourceip, &(ipheader -> source_ip_address));
-				sprintf_ip_int2string(destinationip, &(ipheader -> destination_ip_address));
-				strcat(output.type, "IP");
-				strcat(output.des, "ip:");
-				strcat(output.des, sourceip);
-				strcat(output.des, "->");
-				strcat(output.des, destinationip);
-				strcat(output.des, "; ");
-
-				/* Protocol type of IP */
-				switch (ipheader -> protocol)
-				{
-					/* ICMP Protocol */
-					case (IPTYPE_ICMP): {
-						ICMP_HEADER *icmp_header = (ICMP_HEADER *)(data + sizeof(ETHER_HEADER) + sizeof(IP_HEADER));
-
-						/* ICMP type: request or reply? */
-						strcat(output.des, "type:");
-						switch (icmp_header -> type)
-						{
-							case (ICMP_TYPE_REQUEST): {
-								strcat(output.des, "request");
-								break;
-							}
-							case (ICMP_TYPE_REPLY): {
-								strcat(output.des, "reply");
-								break;
-							}
-							default: {
-								char strtype[8];
-								sprintf(strtype, "%d", icmp_header -> type);
-								strcat(output.des, strtype);
-							}
-						}
-
-						/* Add type information */
-						strcat(output.type, "/ICMP");
-						break;
-					}
-					/* UDP Protocol */
-					case (IPTYPE_UDP): {
-						UDP_HEADER *udp_header = (UDP_HEADER *)(data + sizeof(ETHER_HEADER) + sizeof(IP_HEADER));
-						
-						/* Source port and destination port */
-						char sourceport[6], destinationport[6];
-						sprintf(sourceport, "%d", ntohs(udp_header -> source_port));
-						sprintf(destinationport, "%d", ntohs(udp_header -> destination_port));
-						strcat(output.des, "port:");
-						strcat(output.des, sourceport);
-						strcat(output.des, "->");
-						strcat(output.des, destinationport);
-						strcat(output.des, "; ");
-
-						/* Add type information */
-						strcat(output.type, "/UDP");
-						break;
-					}
-					/* TCP Protocol */
-					case (IPTYPE_TCP): {
-						TCP_HEADER *tcp_header = (TCP_HEADER *)(data + sizeof(ETHER_HEADER) + sizeof(IP_HEADER));
-						
-						/* Source port and destination */
-						char sourceport[6], destinationport[6];
-						sprintf(sourceport, "%d", ntohs(tcp_header -> source_port));
-						sprintf(destinationport, "%d", ntohs(tcp_header -> destination_port));
-						strcat(output.des, "port:");
-						strcat(output.des, sourceport);
-						strcat(output.des, "->");
-						strcat(output.des, destinationport);
-						strcat(output.des, "; ");
-
-						/* Flags */
-						strcat(output.des, "flags:");
-						int n = 0; /* The number of flags */
-						if (tcp_header -> fin)
-						{
-							if (n != 0) {strcat(output.des, ",");}
-							strcat(output.des, "fin");
-							n++;
-						}
-						if (tcp_header -> syn)
-						{
-							if (n != 0) {strcat(output.des, ",");}
-							strcat(output.des, "syn");
-							n++;
-						}
-						if (tcp_header -> rst)
-						{
-							if (n != 0) {strcat(output.des, ",");}
-							strcat(output.des, "rst");
-							n++;
-						}
-						if (tcp_header -> psh)
-						{
-							if (n != 0) {strcat(output.des, ",");}
-							strcat(output.des, "psh");
-							n++;
-						}
-						if (tcp_header -> ack)
-						{
-							if (n != 0) {strcat(output.des, ",");}
-							strcat(output.des, "ack");
-							n++;
-						}
-						if (tcp_header -> urg)
-						{
-							if (n != 0) {strcat(output.des, ",");}
-							strcat(output.des, "urg");
-							n++;
-						}
-						if (tcp_header -> ece)
-						{
-							if (n != 0) {strcat(output.des, ",");}
-							strcat(output.des, "ece");
-							n++;
-						}
-						if (tcp_header -> cwr)
-						{
-							if (n != 0) {strcat(output.des, ",");}
-							strcat(output.des, "cwr");
-							n++;
-						}
-						if (n == 0)
-						{
-							strcat(output.des, "nul");
-						}
-						strcat(output.des, "; ");
-
-						/* Sequence number */
-						char sequencenumber[10];
-						sprintf(sequencenumber, "%u", ntohl(tcp_header -> sequence_number));
-						strcat(output.des, "seq:");
-						strcat(output.des, sequencenumber);
-						strcat(output.des, "; ");
-
-						/* Acknowledgment number */
-						if (tcp_header -> ack)
-						{
-							char acknowledgmentnumber[10];
-							sprintf(acknowledgmentnumber, "%u", ntohl(tcp_header -> acknowledgment_number));
-							strcat(output.des, "ack:");
-							strcat(output.des, acknowledgmentnumber);
-							strcat(output.des, "; ");
-						}
-
-						/* Add type information */
-						strcat(output.type, "/TCP");
-						break;
-					}
-					/* Unknown Protocol */
-					default: {
-						strcat(output.type, "/Unk");
-					}
-				}
-				break;
-			}
-
-			/* ARP protocol */
-			case (ETHERTYPE_ARP): {
-				ARP_HEADER *arp_header = (ARP_HEADER *)(data + sizeof(ETHER_HEADER));
-
-				/* Add type */
-				strcat(output.type, "ARP");
-
-				/* Int IP to String */
-				char sourceip[32], destinationip[32];
-				sprintf_ip_int2string(sourceip, &(arp_header -> source_ip));
-				sprintf_ip_int2string(destinationip, &(arp_header -> destination_ip));
-				strcat(output.des, "ip:");
-				strcat(output.des, sourceip);
-				strcat(output.des, "->");
-				strcat(output.des, destinationip);
-				strcat(output.des, "; ");
-
-				/* Operation code */
-				strcat(output.des, "opcode:");
-				switch (ntohs(arp_header -> opcode))
-				{
-					case (ARP_OPCODE_REQUEST): {
-						strcat(output.des, "request");
-						break;
-					}
-					case (ARP_OPCODE_REPLY): {
-						strcat(output.des, "reply");
-						break;
-					}
-					default: {
-						char stropcode[10];
-						sprintf(stropcode, "%d", ntohs(arp_header -> opcode));
-						strcat(output.des, stropcode);
-					}
-				}
-				strcat(output.des, "; ");
-				break;
-			}
-
-			/* Unknown protocol or haven't provided method */
-			default: {
-				strcat(output.type, "Unk ");
-			}
+			printf("[x] Accept error(igrone)\n");
+			continue;
 		}
+		// Add to listeners list //
+		listenerslist[listenersnumber] = new_fd;
+		listenersnumber++;
 
-		/* Print output */
-		printf("%-10s | %s\n", output.type, output.des);
+		struct sockaddr_in *new_address = (struct sockaddr_in *)(&raddress);
+		uint8_t *ipp = (uint8_t *)&(((struct in_addr *)&(new_address -> sin_addr)) -> s_addr);
+		uint16_t portv = ntohs((uint16_t)(new_address -> sin_port));
+		printf("[+] Accept: %d.%d.%d.%d:%hu\n", *ipp, *(ipp + 1), *(ipp + 2), *(ipp + 3), portv);
 	}
 
 	return 0;
